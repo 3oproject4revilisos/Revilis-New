@@ -34,8 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y debootstrap squashfs-tools xorriso \
-            isolinux syslinux-efi grub-pc-bin grub-efi-amd64-bin mtools dosfstools \
-            zenity debian-archive-keyring
+            mtools dosfstools zenity debian-archive-keyring
 
           # The Ubuntu-packaged live-build is an old fork (3:6.04~git20190206-era)
           # with bootloader templates dated 2012 that hardcode pre-2019 Debian
@@ -56,11 +55,28 @@ jobs:
           Package: live-build
           Pin: release o=Debian
           Pin-Priority: 990
+
+          Package: isolinux syslinux-common syslinux-efi syslinux-utils grub-pc-bin grub-efi-amd64-bin
+          Pin: release o=Debian
+          Pin-Priority: 990
           PIN
 
           sudo apt-get update
-          sudo apt-get install -y -t bookworm live-build
+
+          # CRITICAL: isolinux/syslinux packages must come from the SAME
+          # source (Debian) as live-build itself. If isolinux is installed
+          # from Ubuntu's default repo while live-build is pinned to Debian,
+          # the file layout live-build's binary_syslinux stage expects
+          # (/usr/lib/ISOLINUX/isolinux.bin etc) won't match what's actually
+          # on disk. live-build then silently skips writing the ISO's boot
+          # menu/isolinux.cfg instead of erroring - producing an ISO that
+          # "builds successfully" but boots to a black screen with a
+          # blinking cursor, because there is no boot menu at all.
+          sudo apt-get install -y -t bookworm live-build isolinux syslinux-common syslinux-efi syslinux-utils grub-pc-bin grub-efi-amd64-bin
           lb --version || dpkg -l live-build
+          echo "--- isolinux/syslinux file layout on host (sanity check) ---"
+          dpkg -L isolinux | grep -i bin
+          dpkg -L syslinux-common | grep -i vesamenu
 
       # ---------------------------------------------------------------
       # Everything below generates project files on the runner itself.
@@ -217,29 +233,6 @@ jobs:
           mkdir -p build/bin
           cat > build/bin/revilis <<'REVILIS_EOF'
           #!/usr/bin/env bash
-          # Revilis control CLI
-          #
-          # Two independent layers:
-          #   TIER  - hardware tier (potato/light/balanced/performance/maxed)
-          #           controls zram, swappiness, compositor, blur, animations,
-          #           dock, thumbnails, indexing, and services. Always wins over
-          #           anything a pack would otherwise enable.
-          #   PACK  - use-case pack (developer/gamer/office/home), installs apps.
-          #           You can have multiple packs installed at once.
-          #           Each pack's package list scales with the active tier's
-          #           PACK_WEIGHT (minimal/standard/full).
-          #
-          # Usage:
-          #   revilis                     - interactive menu
-          #   revilis tier list           - list hardware tiers
-          #   revilis tier status         - show current tier + system info
-          #   revilis tier apply <name>   - switch hardware tier
-          #   revilis pack list           - list use-case packs
-          #   revilis pack status         - show installed packs
-          #   revilis pack install <name> - install a use-case pack
-          #   revilis pack remove <name>  - remove a use-case pack
-          #   revilis guide               - show the getting-started guide
-
           set -euo pipefail
 
           TIERS_FILE="/etc/revilis/tiers.conf"
@@ -257,8 +250,6 @@ jobs:
           log() {
               echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
           }
-
-          # ---------- generic INI-style reader (works for both conf files) ----------
 
           list_sections() {
               local file="$1"
@@ -278,8 +269,6 @@ jobs:
                   }
               ' "$file"
           }
-
-          # ---------- state ----------
 
           current_tier() {
               if [[ -f "$STATE_FILE" ]]; then
@@ -305,8 +294,6 @@ jobs:
                   echo "PACKS=$packs"
               } > "$STATE_FILE"
           }
-
-          # ---------- tier commands ----------
 
           cmd_tier_list() {
               echo "Available hardware tiers:"
@@ -387,7 +374,6 @@ jobs:
                   systemctl enable --now "$svc" 2>/dev/null || true
               done
 
-              # Compositor (hard cap - packs cannot override this)
               if [[ "$compositor" == "off" ]]; then
                   log "Disabling XFWM compositor"
                   xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
@@ -398,7 +384,6 @@ jobs:
                   xfconf-query -c xfwm4 -p /general/use_compositing -s true 2>/dev/null || true
               fi
 
-              # Blur (only meaningful if compositor is on)
               if [[ "$blur" == "off" ]] || [[ "$compositor" == "off" ]]; then
                   log "Disabling blur (picom)"
                   pkill picom 2>/dev/null || true
@@ -407,7 +392,6 @@ jobs:
                   nohup picom --config /etc/revilis/picom.conf >/dev/null 2>&1 &
               fi
 
-              # Animations
               if [[ "$animations" == "off" ]]; then
                   log "Disabling XFWM/XFCE animations"
                   xfconf-query -c xfwm4 -p /general/box_move -s false 2>/dev/null || true
@@ -419,7 +403,6 @@ jobs:
                   xfconf-query -c xfwm4 -p /general/box_resize -s true 2>/dev/null || true
               fi
 
-              # Dock
               if [[ "$dock" == "off" ]]; then
                   log "Disabling Plank dock"
                   pkill plank 2>/dev/null || true
@@ -429,7 +412,6 @@ jobs:
                   nohup plank >/dev/null 2>&1 &
               fi
 
-              # Thumbnails
               if [[ "$thumbnails" == "off" ]]; then
                   log "Disabling Thunar thumbnails"
                   xfconf-query -c thunar -p /misc-thumbnail-mode -s "THUNAR_THUMBNAIL_MODE_NEVER" 2>/dev/null || true
@@ -438,7 +420,6 @@ jobs:
                   xfconf-query -c thunar -p /misc-thumbnail-mode -s "THUNAR_THUMBNAIL_MODE_ONLY_LOCAL" 2>/dev/null || true
               fi
 
-              # Indexing
               if [[ "$indexing" == "off" ]]; then
                   log "Disabling file indexing (mlocate cron)"
                   systemctl disable --now mlocate.timer 2>/dev/null || true
@@ -450,7 +431,6 @@ jobs:
               save_state "$tier" "$(installed_packs)"
               log "Tier '$tier' applied successfully."
 
-              # Re-apply already-installed packs so their package weight matches new tier
               local packs
               packs=$(installed_packs)
               if [[ -n "$packs" ]]; then
@@ -463,8 +443,6 @@ jobs:
               echo ""
               echo "Done. Tier '$tier' is now active. Some changes may need a re-login or reboot."
           }
-
-          # ---------- pack commands ----------
 
           cmd_pack_list() {
               echo "Available use-case packs:"
@@ -561,8 +539,6 @@ jobs:
               log "Pack '$pack' removed."
           }
 
-          # ---------- guide ----------
-
           cmd_guide() {
               cat <<'GUIDE_EOF'
           =========================================
@@ -581,20 +557,11 @@ jobs:
              performance -> capable hardware, full look, full-weight packs.
              maxed       -> everything on, full-weight packs, all services on.
 
-             The tier ALWAYS controls visual effects and background services.
-             No pack can turn blur/animations/compositor back on if your tier
-             has them off - this is what keeps low-end hardware smooth.
-
           2) USE-CASE PACKS - which apps you get
              developer   -> editors, git, language runtimes, containers
              gamer       -> gaming platforms, emulation, perf tools
              office      -> documents, spreadsheets, presentations, PDFs
              home        -> everyday browsing, media, communication
-
-             You can install multiple packs at once. Each pack automatically
-             scales its own app list to match your hardware tier - e.g. the
-             gamer pack on 'potato' tier only installs light emulators, while
-             on 'maxed' tier it installs Steam, Wine, OBS, and more.
 
           Commands:
             revilis                        -> interactive menu
@@ -606,13 +573,8 @@ jobs:
             revilis pack install <name>     -> install a use-case pack
             revilis pack remove <name>      -> remove a use-case pack
             revilis guide                   -> show this guide again any time
-
-          Nothing here is a one-time install choice - change tiers and packs
-          any time.
           GUIDE_EOF
           }
-
-          # ---------- interactive menu ----------
 
           interactive_menu() {
               echo "=== Revilis Manager ==="
@@ -645,8 +607,6 @@ jobs:
                   *) echo "Unknown option" ;;
               esac
           }
-
-          # ---------- entrypoint ----------
 
           case "${1:-}" in
               tier)
@@ -701,7 +661,6 @@ jobs:
           esac
           REVILIS_EOF
           chmod +x build/bin/revilis
-
 
       - name: Generate first-boot welcome GUI
         run: |
@@ -817,7 +776,6 @@ jobs:
           mkdir -p build/skel/.config/plank/dock1
           mkdir -p build/skel/.config/autostart
 
-          # --- Top panel: single Mac-style bar, no global menu, clock+status icons ---
           cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfce4-panel" version="1.0">
@@ -854,10 +812,6 @@ jobs:
           </channel>
           EOF
 
-          # --- XFWM: keep buttons top-right (not Mac-left), themed for hover-highlight only ---
-          # Note: XFWM doesn't support per-button hover color natively via xfconf alone;
-          # the hover-highlight look comes from the GTK/xfwm theme's button assets
-          # (installed via revilis-theme, see hook below), this just sets layout + theme name.
           cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfwm4" version="1.0">
@@ -873,7 +827,6 @@ jobs:
           </channel>
           EOF
 
-          # --- GTK / icon theme selection ---
           cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xsettings" version="1.0">
@@ -887,7 +840,6 @@ jobs:
           </channel>
           EOF
 
-          # --- Plank dock config: bottom, zoom-on-hover, translucent/blur-style theme ---
           cat > "build/skel/.config/plank/dock1/settings" <<'EOF'
           [PlankDockPreferences]
           Position=bottom
@@ -900,7 +852,6 @@ jobs:
           PinnedOnly=false
           EOF
 
-          # Autostart plank on login
           cat > build/skel/.config/autostart/plank.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
@@ -911,7 +862,6 @@ jobs:
           X-GNOME-Autostart-enabled=true
           EOF
 
-          # Autostart picom for blur/transparency behind the dock and windows
           cat > build/skel/.config/autostart/picom.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
@@ -924,8 +874,6 @@ jobs:
 
           mkdir -p build/config/revilis
           cat > build/config/revilis/picom.conf <<'EOF'
-          # Revilis compositor config: blur + rounded-corner feel for the dock/panel,
-          # kept light so it stays usable on the 'potato' preset if compositor is off anyway.
           backend = "glx";
           vsync = true;
 
@@ -981,10 +929,6 @@ jobs:
               --mirror-binary "http://deb.debian.org/debian" \
               --mirror-binary-security "http://security.debian.org/debian-security"
 
-          # live-build's own --security flag generates an outdated "DIST/updates"
-          # security suite path that doesn't exist since Debian bookworm (the
-          # correct suite is "bookworm-security"). We disabled it above and
-          # write the correct sources.list files ourselves instead.
           mkdir -p config/archives
           cat > config/archives/revilis-security.list.chroot <<'EOF'
           deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
@@ -1020,8 +964,6 @@ jobs:
           mlocate
           linux-image-amd64
           firmware-linux
-          isolinux
-          syslinux-common
           EOF
 
           mkdir -p config/includes.chroot/usr/local/bin
@@ -1079,20 +1021,6 @@ jobs:
 
           systemctl enable NetworkManager || true
           systemctl enable lightdm || true
-
-          # Compatibility symlinks: this live-build version's bundled isolinux
-          # template (/usr/share/live/build/bootloaders/isolinux) hardcodes
-          # old pre-2019 paths (/usr/lib/syslinux/isolinux.bin and
-          # /usr/lib/syslinux/vesamenu.c32) that no longer exist in current
-          # Debian. Modern packages install these files elsewhere, so we
-          # bridge the two with symlinks the old template can dereference.
-          mkdir -p /usr/lib/syslinux
-          if [ -f /usr/lib/ISOLINUX/isolinux.bin ] && [ ! -e /usr/lib/syslinux/isolinux.bin ]; then
-              ln -s /usr/lib/ISOLINUX/isolinux.bin /usr/lib/syslinux/isolinux.bin
-          fi
-          if [ -f /usr/lib/syslinux/modules/bios/vesamenu.c32 ] && [ ! -e /usr/lib/syslinux/vesamenu.c32 ]; then
-              ln -s /usr/lib/syslinux/modules/bios/vesamenu.c32 /usr/lib/syslinux/vesamenu.c32
-          fi
 
           echo "revilis setup hook complete"
           EOF
