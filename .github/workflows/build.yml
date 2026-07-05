@@ -996,6 +996,8 @@ jobs:
           mlocate
           linux-image-amd64
           firmware-linux
+          isolinux
+          syslinux-common
           EOF
 
           mkdir -p config/includes.chroot/usr/local/bin
