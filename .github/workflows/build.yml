@@ -943,8 +943,7 @@ jobs:
               --iso-volume "REVILIS" \
               --iso-preparer "Revilis Project" \
               --iso-publisher "Revilis Project" \
-              --linux-flavours "amd64:amd64" \
-              --linux-packages "linux-image linux-headers" \
+              --linux-flavours amd64 \
               --memtest none \
               --win32-loader false \
               --debian-installer none \
@@ -994,6 +993,8 @@ jobs:
           picom
           xdotool
           mlocate
+          linux-image-amd64
+          firmware-linux
           EOF
 
           mkdir -p config/includes.chroot/usr/local/bin
