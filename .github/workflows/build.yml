@@ -963,7 +963,7 @@ jobs:
               --distribution bookworm \
               --archive-areas "main contrib non-free non-free-firmware" \
               --architecture amd64 \
-              --binary-images iso-hybrid \
+              --binary-image iso-hybrid \
               --iso-application "Revilis Prototype" \
               --iso-volume "REVILIS" \
               --iso-preparer "Revilis Project" \
@@ -972,9 +972,8 @@ jobs:
               --firmware-chroot false \
               --memtest none \
               --win32-loader false \
-              --debian-installer false \
+              --debian-installer none \
               --apt-recommends false \
-              --bootstrap-keyring "debian-archive-keyring" \
               --mirror-bootstrap "http://deb.debian.org/debian" \
               --mirror-chroot "http://deb.debian.org/debian" \
               --mirror-chroot-security "http://security.debian.org/debian-security" \
