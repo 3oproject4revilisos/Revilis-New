@@ -30,12 +30,37 @@ jobs:
           echo "Disk after cleanup:"
           df -h
 
-      - name: Install live-build and dependencies
+      - name: Install live-build (from Debian directly, not Ubuntu's stale fork) and dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y live-build debootstrap squashfs-tools xorriso \
+          sudo apt-get install -y debootstrap squashfs-tools xorriso \
             isolinux syslinux-efi grub-pc-bin grub-efi-amd64-bin mtools dosfstools \
             zenity debian-archive-keyring
+
+          # The Ubuntu-packaged live-build is an old fork (3:6.04~git20190206-era)
+          # with bootloader templates dated 2012 that hardcode pre-2019 Debian
+          # file paths (e.g. /usr/lib/syslinux/isolinux.bin, which no longer
+          # exists - modern Debian puts it in /usr/lib/ISOLINUX/). This causes
+          # repeated bootloader-assembly failures. We install Debian's own
+          # current live-build package instead, from Debian's repo directly,
+          # pinned so it doesn't affect any other package on the runner.
+          echo "deb http://deb.debian.org/debian bookworm main" | sudo tee /etc/apt/sources.list.d/debian-bookworm-temp.list
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 0E98404D386FA1D9 2>/dev/null || true
+          sudo cp /usr/share/keyrings/debian-archive-keyring.gpg /etc/apt/trusted.gpg.d/ 2>/dev/null || true
+
+          cat <<'PIN' | sudo tee /etc/apt/preferences.d/debian-bookworm-temp
+          Package: *
+          Pin: release o=Debian
+          Pin-Priority: 100
+
+          Package: live-build
+          Pin: release o=Debian
+          Pin-Priority: 990
+          PIN
+
+          sudo apt-get update
+          sudo apt-get install -y -t bookworm live-build
+          lb --version || dpkg -l live-build
 
       # ---------------------------------------------------------------
       # Everything below generates project files on the runner itself.
@@ -1055,6 +1080,20 @@ jobs:
 
           systemctl enable NetworkManager || true
           systemctl enable lightdm || true
+
+          # Compatibility symlinks: this live-build version's bundled isolinux
+          # template (/usr/share/live/build/bootloaders/isolinux) hardcodes
+          # old pre-2019 paths (/usr/lib/syslinux/isolinux.bin and
+          # /usr/lib/syslinux/vesamenu.c32) that no longer exist in current
+          # Debian. Modern packages install these files elsewhere, so we
+          # bridge the two with symlinks the old template can dereference.
+          mkdir -p /usr/lib/syslinux
+          if [ -f /usr/lib/ISOLINUX/isolinux.bin ] && [ ! -e /usr/lib/syslinux/isolinux.bin ]; then
+              ln -s /usr/lib/ISOLINUX/isolinux.bin /usr/lib/syslinux/isolinux.bin
+          fi
+          if [ -f /usr/lib/syslinux/modules/bios/vesamenu.c32 ] && [ ! -e /usr/lib/syslinux/vesamenu.c32 ]; then
+              ln -s /usr/lib/syslinux/modules/bios/vesamenu.c32 /usr/lib/syslinux/vesamenu.c32
+          fi
 
           echo "revilis setup hook complete"
           EOF
