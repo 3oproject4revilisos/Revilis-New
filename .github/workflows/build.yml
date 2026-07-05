@@ -1,0 +1,1131 @@
+name: Build Revilis Prototype ISO
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish this build as a GitHub Release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: revilis-iso-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Free up disk space on runner
+        run: |
+          echo "Disk before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -a -f || true
+          echo "Disk after cleanup:"
+          df -h
+
+      - name: Install live-build and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y live-build debootstrap squashfs-tools xorriso \
+            isolinux syslinux-efi grub-pc-bin grub-efi-amd64-bin mtools dosfstools \
+            zenity debian-archive-keyring
+
+      # ---------------------------------------------------------------
+      # Everything below generates project files on the runner itself.
+      # Nothing is read from the repo except this workflow file.
+      # ---------------------------------------------------------------
+
+      - name: Generate tiers.conf (hardware tiers - system-level only)
+        run: |
+          mkdir -p build/config/revilis
+          cat > build/config/revilis/tiers.conf <<'TIERS_EOF'
+          # Revilis Hardware Tiers
+          # Tiers control ONLY system-level behavior: zram, swappiness, compositor,
+          # blur/animations, and background services. They do NOT install apps.
+          # App choice comes from use-case PACKS (packs.conf), which are scaled
+          # down per-tier separately.
+          #
+          # ZRAM_PERCENT     - % of RAM used for zram swap
+          # ZRAM_ALGO        - compression algorithm
+          # TARGET_IDLE_MB   - approximate idle RAM target (informational)
+          # SWAPPINESS       - vm.swappiness value
+          # COMPOSITOR       - xfwm compositor on/off (hard cap - packs cannot override)
+          # BLUR             - picom blur on/off (hard cap - packs cannot override)
+          # ANIMATIONS       - xfwm/xfce animations on/off (hard cap)
+          # DOCK             - plank dock on/off (very old hardware skips it entirely)
+          # THUMBNAILS       - thunar thumbnail generation on/off
+          # INDEXING         - file search indexing (e.g. locate/mlocate cron) on/off
+          # SERVICES_DISABLE - services to mask/disable for this tier
+          # SERVICES_ENABLE  - services to enable for this tier
+          # PACK_WEIGHT      - which pack variant tier to use: minimal | standard | full
+          #                    (packs.conf defines PACKAGES_MINIMAL/STANDARD/FULL per pack)
+
+          [potato]
+          ZRAM_PERCENT=50
+          ZRAM_ALGO=lz4
+          TARGET_IDLE_MB=500
+          SWAPPINESS=100
+          COMPOSITOR=off
+          BLUR=off
+          ANIMATIONS=off
+          DOCK=off
+          THUMBNAILS=off
+          INDEXING=off
+          PACK_WEIGHT=minimal
+          SERVICES_DISABLE="bluetooth cups avahi-daemon ModemManager"
+          SERVICES_ENABLE=""
+          DESCRIPTION="Bare minimum. Tuned for ~1GB RAM, 1-2 cores, HDD. No compositor, no blur, no animations, no dock, no thumbnails, no indexing."
+
+          [light]
+          ZRAM_PERCENT=40
+          ZRAM_ALGO=lz4
+          TARGET_IDLE_MB=700
+          SWAPPINESS=80
+          COMPOSITOR=off
+          BLUR=off
+          ANIMATIONS=off
+          DOCK=on
+          THUMBNAILS=on
+          INDEXING=off
+          PACK_WEIGHT=minimal
+          SERVICES_DISABLE="bluetooth cups"
+          SERVICES_ENABLE="avahi-daemon"
+          DESCRIPTION="Low-spec but usable. Dock on, but no compositor/blur/animations. Basic thumbnails."
+
+          [balanced]
+          ZRAM_PERCENT=30
+          ZRAM_ALGO=zstd
+          TARGET_IDLE_MB=1000
+          SWAPPINESS=60
+          COMPOSITOR=on
+          BLUR=on
+          ANIMATIONS=on
+          DOCK=on
+          THUMBNAILS=on
+          INDEXING=on
+          PACK_WEIGHT=standard
+          SERVICES_DISABLE=""
+          SERVICES_ENABLE="bluetooth cups avahi-daemon"
+          DESCRIPTION="The recommended default. Full look: compositor, blur, animations, dock all on."
+
+          [performance]
+          ZRAM_PERCENT=20
+          ZRAM_ALGO=zstd
+          TARGET_IDLE_MB=1500
+          SWAPPINESS=40
+          COMPOSITOR=on
+          BLUR=on
+          ANIMATIONS=on
+          DOCK=on
+          THUMBNAILS=on
+          INDEXING=on
+          PACK_WEIGHT=standard
+          SERVICES_DISABLE=""
+          SERVICES_ENABLE="bluetooth cups avahi-daemon"
+          DESCRIPTION="For capable hardware. Full look and full-weight packs."
+
+          [maxed]
+          ZRAM_PERCENT=10
+          ZRAM_ALGO=zstd
+          TARGET_IDLE_MB=2000
+          SWAPPINESS=20
+          COMPOSITOR=on
+          BLUR=on
+          ANIMATIONS=on
+          DOCK=on
+          THUMBNAILS=on
+          INDEXING=on
+          PACK_WEIGHT=full
+          SERVICES_DISABLE=""
+          SERVICES_ENABLE="bluetooth cups avahi-daemon"
+          DESCRIPTION="Everything. Full look, full-weight packs, all services on."
+          TIERS_EOF
+
+      - name: Generate packs.conf (use-case app packs, scaled per hardware tier)
+        run: |
+          mkdir -p build/config/revilis
+          cat > build/config/revilis/packs.conf <<'PACKS_EOF'
+          # Revilis Use-Case Packs
+          # Each pack defines THREE package lists, one per PACK_WEIGHT from the
+          # active hardware tier:
+          #   PACKAGES_MINIMAL  - used on potato/light tiers
+          #   PACKAGES_STANDARD - used on balanced/performance tiers
+          #   PACKAGES_FULL     - used on maxed tier
+          # A user can install more than one pack at once (e.g. developer + office).
+          # Packs never override tier system-settings (compositor/blur/animations/etc);
+          # those are always controlled by the active tier alone.
+
+          [developer]
+          DESCRIPTION="Code editors, git, language runtimes, containers."
+          PACKAGES_MINIMAL="git nano micro python3 build-essential"
+          PACKAGES_STANDARD="git nano micro python3 python3-pip build-essential code default-jdk nodejs npm docker.io"
+          PACKAGES_FULL="git nano micro python3 python3-pip python3-venv build-essential code default-jdk nodejs npm docker.io docker-compose golang rustc cargo postgresql-client sqlite3 gh"
+
+          [gamer]
+          DESCRIPTION="Gaming platforms, emulation, performance tools."
+          PACKAGES_MINIMAL="scummvm"
+          PACKAGES_STANDARD="steam-installer lutris gamemode mangohud"
+          PACKAGES_FULL="steam-installer lutris gamemode mangohud wine winetricks retroarch obs-studio"
+
+          [office]
+          DESCRIPTION="Documents, spreadsheets, presentations, PDFs."
+          PACKAGES_MINIMAL="abiword gnumeric xpdf"
+          PACKAGES_STANDARD="libreoffice-writer libreoffice-calc libreoffice-impress xpdf"
+          PACKAGES_FULL="libreoffice libreoffice-base gimp xpdf pdfarranger thunderbird"
+
+          [home]
+          DESCRIPTION="Everyday browsing, media, communication."
+          PACKAGES_MINIMAL="firefox-esr mpv"
+          PACKAGES_STANDARD="firefox-esr vlc gimp hexchat"
+          PACKAGES_FULL="firefox-esr vlc gimp hexchat spotify-client discord thunderbird"
+          PACKS_EOF
+
+      - name: Generate revilis CLI
+        run: |
+          mkdir -p build/bin
+          cat > build/bin/revilis <<'REVILIS_EOF'
+          #!/usr/bin/env bash
+          # Revilis control CLI
+          #
+          # Two independent layers:
+          #   TIER  - hardware tier (potato/light/balanced/performance/maxed)
+          #           controls zram, swappiness, compositor, blur, animations,
+          #           dock, thumbnails, indexing, and services. Always wins over
+          #           anything a pack would otherwise enable.
+          #   PACK  - use-case pack (developer/gamer/office/home), installs apps.
+          #           You can have multiple packs installed at once.
+          #           Each pack's package list scales with the active tier's
+          #           PACK_WEIGHT (minimal/standard/full).
+          #
+          # Usage:
+          #   revilis                     - interactive menu
+          #   revilis tier list           - list hardware tiers
+          #   revilis tier status         - show current tier + system info
+          #   revilis tier apply <name>   - switch hardware tier
+          #   revilis pack list           - list use-case packs
+          #   revilis pack status         - show installed packs
+          #   revilis pack install <name> - install a use-case pack
+          #   revilis pack remove <name>  - remove a use-case pack
+          #   revilis guide               - show the getting-started guide
+
+          set -euo pipefail
+
+          TIERS_FILE="/etc/revilis/tiers.conf"
+          PACKS_FILE="/etc/revilis/packs.conf"
+          STATE_FILE="/etc/revilis/state"
+          LOG_FILE="/var/log/revilis.log"
+
+          require_root() {
+              if [[ $EUID -ne 0 ]]; then
+                  echo "This action needs root. Re-running with sudo..."
+                  exec sudo "$0" "$@"
+              fi
+          }
+
+          log() {
+              echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+          }
+
+          # ---------- generic INI-style reader (works for both conf files) ----------
+
+          list_sections() {
+              local file="$1"
+              grep -oP '^\[\K[a-z]+(?=\])' "$file"
+          }
+
+          get_field() {
+              local file="$1" section="$2" key="$3"
+              awk -v p="[$section]" -v k="$key" '
+                  $0 == p {found=1; next}
+                  /^\[/{found=0}
+                  found && $0 ~ "^"k"=" {
+                      sub("^"k"=", "");
+                      gsub(/^"|"$/, "");
+                      print;
+                      exit
+                  }
+              ' "$file"
+          }
+
+          # ---------- state ----------
+
+          current_tier() {
+              if [[ -f "$STATE_FILE" ]]; then
+                  grep -oP '^TIER=\K.*' "$STATE_FILE" 2>/dev/null || echo "none"
+              else
+                  echo "none"
+              fi
+          }
+
+          installed_packs() {
+              if [[ -f "$STATE_FILE" ]]; then
+                  grep -oP '^PACKS=\K.*' "$STATE_FILE" 2>/dev/null || echo ""
+              else
+                  echo ""
+              fi
+          }
+
+          save_state() {
+              local tier="$1" packs="$2"
+              mkdir -p /etc/revilis
+              {
+                  echo "TIER=$tier"
+                  echo "PACKS=$packs"
+              } > "$STATE_FILE"
+          }
+
+          # ---------- tier commands ----------
+
+          cmd_tier_list() {
+              echo "Available hardware tiers:"
+              echo ""
+              for t in $(list_sections "$TIERS_FILE"); do
+                  local desc target_mb
+                  desc=$(get_field "$TIERS_FILE" "$t" DESCRIPTION)
+                  target_mb=$(get_field "$TIERS_FILE" "$t" TARGET_IDLE_MB)
+                  printf "  %-12s ~%sMB idle  - %s\n" "$t" "$target_mb" "$desc"
+              done
+          }
+
+          cmd_tier_status() {
+              local tier mem_total mem_used zram_size packs
+              tier=$(current_tier)
+              packs=$(installed_packs)
+              mem_total=$(free -h | awk '/^Mem:/{print $2}')
+              mem_used=$(free -h | awk '/^Mem:/{print $3}')
+              zram_size=$(zramctl --output NAME,DISKSIZE,COMP-ALGORITHM --noheadings 2>/dev/null || echo "no zram active")
+
+              echo "=== Revilis Status ==="
+              echo "Hardware tier : $tier"
+              echo "Installed packs: ${packs:-none}"
+              echo "RAM total     : $mem_total"
+              echo "RAM used      : $mem_used"
+              echo "zram devices  :"
+              echo "$zram_size"
+              echo ""
+              echo "Run 'revilis tier list' or 'revilis pack list' to see other options."
+          }
+
+          cmd_tier_apply() {
+              local tier="$1"
+              require_root "$@"
+
+              if ! list_sections "$TIERS_FILE" | grep -qx "$tier"; then
+                  echo "Unknown tier: $tier"
+                  echo "Available: $(list_sections "$TIERS_FILE" | tr '\n' ' ')"
+                  exit 1
+              fi
+
+              log "Applying hardware tier: $tier"
+
+              local zram_percent zram_algo swappiness compositor blur animations dock thumbnails indexing svc_disable svc_enable
+
+              zram_percent=$(get_field "$TIERS_FILE" "$tier" ZRAM_PERCENT)
+              zram_algo=$(get_field "$TIERS_FILE" "$tier" ZRAM_ALGO)
+              swappiness=$(get_field "$TIERS_FILE" "$tier" SWAPPINESS)
+              compositor=$(get_field "$TIERS_FILE" "$tier" COMPOSITOR)
+              blur=$(get_field "$TIERS_FILE" "$tier" BLUR)
+              animations=$(get_field "$TIERS_FILE" "$tier" ANIMATIONS)
+              dock=$(get_field "$TIERS_FILE" "$tier" DOCK)
+              thumbnails=$(get_field "$TIERS_FILE" "$tier" THUMBNAILS)
+              indexing=$(get_field "$TIERS_FILE" "$tier" INDEXING)
+              svc_disable=$(get_field "$TIERS_FILE" "$tier" SERVICES_DISABLE)
+              svc_enable=$(get_field "$TIERS_FILE" "$tier" SERVICES_ENABLE)
+
+              log "Configuring zram: ${zram_percent}% RAM, algo=$zram_algo"
+              cat > /etc/systemd/zram-generator.conf <<EOF
+          [zram0]
+          zram-size = ram * ${zram_percent} / 100
+          compression-algorithm = ${zram_algo}
+          EOF
+              systemctl daemon-reexec || true
+              systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
+
+              log "Setting vm.swappiness=$swappiness"
+              sed -i '/^vm.swappiness=/d' /etc/sysctl.conf
+              echo "vm.swappiness=$swappiness" >> /etc/sysctl.conf
+              sysctl -p >/dev/null
+
+              for svc in $svc_disable; do
+                  log "Disabling service: $svc"
+                  systemctl disable --now "$svc" 2>/dev/null || true
+              done
+              for svc in $svc_enable; do
+                  log "Enabling service: $svc"
+                  systemctl enable --now "$svc" 2>/dev/null || true
+              done
+
+              # Compositor (hard cap - packs cannot override this)
+              if [[ "$compositor" == "off" ]]; then
+                  log "Disabling XFWM compositor"
+                  xfconf-query -c xfwm4 -p /general/use_compositing -s false 2>/dev/null || true
+                  systemctl --user stop picom 2>/dev/null || pkill picom 2>/dev/null || true
+                  rm -f "$HOME/.config/autostart/picom.desktop" 2>/dev/null || true
+              else
+                  log "Enabling XFWM compositor"
+                  xfconf-query -c xfwm4 -p /general/use_compositing -s true 2>/dev/null || true
+              fi
+
+              # Blur (only meaningful if compositor is on)
+              if [[ "$blur" == "off" ]] || [[ "$compositor" == "off" ]]; then
+                  log "Disabling blur (picom)"
+                  pkill picom 2>/dev/null || true
+              else
+                  log "Enabling blur (picom)"
+                  nohup picom --config /etc/revilis/picom.conf >/dev/null 2>&1 &
+              fi
+
+              # Animations
+              if [[ "$animations" == "off" ]]; then
+                  log "Disabling XFWM/XFCE animations"
+                  xfconf-query -c xfwm4 -p /general/box_move -s false 2>/dev/null || true
+                  xfconf-query -c xfwm4 -p /general/box_resize -s false 2>/dev/null || true
+                  xfconf-query -c xfce4-session -p /general/PromptOnLogout -s false 2>/dev/null || true
+              else
+                  log "Enabling XFWM/XFCE animations"
+                  xfconf-query -c xfwm4 -p /general/box_move -s true 2>/dev/null || true
+                  xfconf-query -c xfwm4 -p /general/box_resize -s true 2>/dev/null || true
+              fi
+
+              # Dock
+              if [[ "$dock" == "off" ]]; then
+                  log "Disabling Plank dock"
+                  pkill plank 2>/dev/null || true
+                  rm -f "$HOME/.config/autostart/plank.desktop" 2>/dev/null || true
+              else
+                  log "Enabling Plank dock"
+                  nohup plank >/dev/null 2>&1 &
+              fi
+
+              # Thumbnails
+              if [[ "$thumbnails" == "off" ]]; then
+                  log "Disabling Thunar thumbnails"
+                  xfconf-query -c thunar -p /misc-thumbnail-mode -s "THUNAR_THUMBNAIL_MODE_NEVER" 2>/dev/null || true
+              else
+                  log "Enabling Thunar thumbnails"
+                  xfconf-query -c thunar -p /misc-thumbnail-mode -s "THUNAR_THUMBNAIL_MODE_ONLY_LOCAL" 2>/dev/null || true
+              fi
+
+              # Indexing
+              if [[ "$indexing" == "off" ]]; then
+                  log "Disabling file indexing (mlocate cron)"
+                  systemctl disable --now mlocate.timer 2>/dev/null || true
+              else
+                  log "Enabling file indexing (mlocate cron)"
+                  systemctl enable --now mlocate.timer 2>/dev/null || true
+              fi
+
+              save_state "$tier" "$(installed_packs)"
+              log "Tier '$tier' applied successfully."
+
+              # Re-apply already-installed packs so their package weight matches new tier
+              local packs
+              packs=$(installed_packs)
+              if [[ -n "$packs" ]]; then
+                  log "Re-scaling installed packs ($packs) to match new tier weight"
+                  for p in $packs; do
+                      cmd_pack_install "$p" --requiet || true
+                  done
+              fi
+
+              echo ""
+              echo "Done. Tier '$tier' is now active. Some changes may need a re-login or reboot."
+          }
+
+          # ---------- pack commands ----------
+
+          cmd_pack_list() {
+              echo "Available use-case packs:"
+              echo ""
+              for p in $(list_sections "$PACKS_FILE"); do
+                  local desc
+                  desc=$(get_field "$PACKS_FILE" "$p" DESCRIPTION)
+                  printf "  %-12s - %s\n" "$p" "$desc"
+              done
+              echo ""
+              echo "Packs scale their package list to your current hardware tier automatically."
+          }
+
+          cmd_pack_status() {
+              local packs
+              packs=$(installed_packs)
+              echo "Installed packs: ${packs:-none}"
+          }
+
+          pack_weight_field() {
+              local weight="$1"
+              case "$weight" in
+                  minimal)  echo "PACKAGES_MINIMAL" ;;
+                  standard) echo "PACKAGES_STANDARD" ;;
+                  full)     echo "PACKAGES_FULL" ;;
+                  *)        echo "PACKAGES_STANDARD" ;;
+              esac
+          }
+
+          cmd_pack_install() {
+              local pack="$1"
+              local quiet="${2:-}"
+              require_root "$@"
+
+              if ! list_sections "$PACKS_FILE" | grep -qx "$pack"; then
+                  echo "Unknown pack: $pack"
+                  echo "Available: $(list_sections "$PACKS_FILE" | tr '\n' ' ')"
+                  exit 1
+              fi
+
+              local tier weight field packages
+              tier=$(current_tier)
+              if [[ "$tier" == "none" ]]; then
+                  echo "No hardware tier applied yet. Run 'revilis tier apply <name>' first"
+                  echo "(defaulting to 'balanced' weight for this install)."
+                  weight="standard"
+              else
+                  weight=$(get_field "$TIERS_FILE" "$tier" PACK_WEIGHT)
+              fi
+
+              field=$(pack_weight_field "$weight")
+              packages=$(get_field "$PACKS_FILE" "$pack" "$field")
+
+              log "Installing pack '$pack' at weight '$weight' (tier: $tier): $packages"
+              apt-get update -qq
+              # shellcheck disable=SC2086
+              apt-get install -y --no-install-recommends $packages
+
+              local current_packs new_packs
+              current_packs=$(installed_packs)
+              if [[ " $current_packs " != *" $pack "* ]]; then
+                  new_packs="${current_packs:+$current_packs }$pack"
+              else
+                  new_packs="$current_packs"
+              fi
+              save_state "$tier" "$new_packs"
+
+              if [[ "$quiet" != "--requiet" ]]; then
+                  log "Pack '$pack' installed successfully."
+                  echo ""
+                  echo "Done. Pack '$pack' is now installed at '$weight' weight."
+              fi
+          }
+
+          cmd_pack_remove() {
+              local pack="$1"
+              require_root "$@"
+
+              local field packages tier weight
+              tier=$(current_tier)
+              weight=$(get_field "$TIERS_FILE" "$tier" PACK_WEIGHT 2>/dev/null || echo "standard")
+              field=$(pack_weight_field "$weight")
+              packages=$(get_field "$PACKS_FILE" "$pack" "$field")
+
+              log "Removing pack '$pack': $packages"
+              # shellcheck disable=SC2086
+              apt-get remove -y $packages 2>/dev/null || true
+
+              local current_packs new_packs
+              current_packs=$(installed_packs)
+              new_packs=$(echo "$current_packs" | tr ' ' '\n' | grep -vx "$pack" | tr '\n' ' ' | xargs || true)
+              save_state "$tier" "$new_packs"
+
+              log "Pack '$pack' removed."
+          }
+
+          # ---------- guide ----------
+
+          cmd_guide() {
+              cat <<'GUIDE_EOF'
+          =========================================
+           Welcome to Revilis (Prototype / Debian)
+          =========================================
+
+          Revilis has TWO independent layers you control:
+
+          1) HARDWARE TIER - how heavy your system runs
+             potato      -> ~1GB RAM, 1-2 cores, HDD floor. No compositor, no
+                            blur, no animations, no dock, no thumbnails, no
+                            indexing. ~500MB idle.
+             light       -> low-spec but usable, dock on, still no effects.
+             balanced    -> recommended default, full look (compositor, blur,
+                            animations, dock all on).
+             performance -> capable hardware, full look, full-weight packs.
+             maxed       -> everything on, full-weight packs, all services on.
+
+             The tier ALWAYS controls visual effects and background services.
+             No pack can turn blur/animations/compositor back on if your tier
+             has them off - this is what keeps low-end hardware smooth.
+
+          2) USE-CASE PACKS - which apps you get
+             developer   -> editors, git, language runtimes, containers
+             gamer       -> gaming platforms, emulation, perf tools
+             office      -> documents, spreadsheets, presentations, PDFs
+             home        -> everyday browsing, media, communication
+
+             You can install multiple packs at once. Each pack automatically
+             scales its own app list to match your hardware tier - e.g. the
+             gamer pack on 'potato' tier only installs light emulators, while
+             on 'maxed' tier it installs Steam, Wine, OBS, and more.
+
+          Commands:
+            revilis                        -> interactive menu
+            revilis tier list               -> show all hardware tiers
+            revilis tier status             -> show current tier + RAM/zram usage
+            revilis tier apply <name>       -> switch hardware tier
+            revilis pack list               -> show all use-case packs
+            revilis pack status             -> show installed packs
+            revilis pack install <name>     -> install a use-case pack
+            revilis pack remove <name>      -> remove a use-case pack
+            revilis guide                   -> show this guide again any time
+
+          Nothing here is a one-time install choice - change tiers and packs
+          any time.
+          GUIDE_EOF
+          }
+
+          # ---------- interactive menu ----------
+
+          interactive_menu() {
+              echo "=== Revilis Manager ==="
+              echo ""
+              echo "1) Hardware tiers (system speed/effects)"
+              echo "2) Use-case packs (apps)"
+              echo "3) Status"
+              echo "4) Guide"
+              echo "q) Quit"
+              echo ""
+              read -rp "Choose: " top_choice
+              case "$top_choice" in
+                  1)
+                      cmd_tier_list
+                      echo ""
+                      read -rp "Enter tier name to apply (or 'q'): " t
+                      [[ "$t" == "q" ]] && exit 0
+                      cmd_tier_apply "$t"
+                      ;;
+                  2)
+                      cmd_pack_list
+                      echo ""
+                      read -rp "Enter pack name to install (or 'q'): " p
+                      [[ "$p" == "q" ]] && exit 0
+                      cmd_pack_install "$p"
+                      ;;
+                  3) cmd_tier_status; cmd_pack_status ;;
+                  4) cmd_guide ;;
+                  q) exit 0 ;;
+                  *) echo "Unknown option" ;;
+              esac
+          }
+
+          # ---------- entrypoint ----------
+
+          case "${1:-}" in
+              tier)
+                  case "${2:-}" in
+                      list) cmd_tier_list ;;
+                      status) cmd_tier_status ;;
+                      apply)
+                          if [[ -z "${3:-}" ]]; then
+                              echo "Usage: revilis tier apply <name>"
+                              exit 1
+                          fi
+                          cmd_tier_apply "$3"
+                          ;;
+                      *)
+                          echo "Usage: revilis tier [list|status|apply <name>]"
+                          exit 1
+                          ;;
+                  esac
+                  ;;
+              pack)
+                  case "${2:-}" in
+                      list) cmd_pack_list ;;
+                      status) cmd_pack_status ;;
+                      install)
+                          if [[ -z "${3:-}" ]]; then
+                              echo "Usage: revilis pack install <name>"
+                              exit 1
+                          fi
+                          cmd_pack_install "$3"
+                          ;;
+                      remove)
+                          if [[ -z "${3:-}" ]]; then
+                              echo "Usage: revilis pack remove <name>"
+                              exit 1
+                          fi
+                          cmd_pack_remove "$3"
+                          ;;
+                      *)
+                          echo "Usage: revilis pack [list|status|install <name>|remove <name>]"
+                          exit 1
+                          ;;
+                  esac
+                  ;;
+              guide) cmd_guide ;;
+              status) cmd_tier_status; cmd_pack_status ;;
+              "" ) interactive_menu ;;
+              *)
+                  echo "Unknown command: $1"
+                  echo "Usage: revilis [tier|pack|status|guide]"
+                  exit 1
+                  ;;
+          esac
+          REVILIS_EOF
+          chmod +x build/bin/revilis
+
+
+      - name: Generate first-boot welcome GUI
+        run: |
+          mkdir -p build/bin
+          cat > build/bin/revilis-firstboot-gui <<'FIRSTBOOT_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          MARKER="$HOME/.config/revilis/.firstboot-shown"
+          AUTOSTART_FILE="$HOME/.config/autostart/revilis-firstboot.desktop"
+
+          mkdir -p "$HOME/.config/revilis"
+
+          if [[ -f "$MARKER" ]]; then
+              exit 0
+          fi
+
+          if ! command -v zenity >/dev/null 2>&1; then
+              echo "zenity not found, skipping first-boot welcome" >> /tmp/revilis-firstboot.log
+              touch "$MARKER"
+              exit 0
+          fi
+
+          zenity --info --width=520 --title="Welcome to Revilis" --text="\
+          <b>Welcome to Revilis (Prototype)</b>\n\n\
+          Revilis has two independent settings:\n\n\
+          <b>Hardware tier</b> - how heavy your system runs (zram, effects, services)\n\
+          <b>Use-case packs</b> - which apps you get (you can pick more than one)\n\n\
+          Let's set both up now. You can change either any time later with the\n\
+          'revilis' command or the desktop shortcut." 2>/dev/null || true
+
+          TIER=$(zenity --list --title="Choose your hardware tier" \
+              --text="Pick the tier that matches your hardware (change later with 'revilis tier apply <name>'):" \
+              --radiolist \
+              --column="Pick" --column="Tier" --column="Description" \
+              TRUE  "balanced"    "Recommended default - most modern machines" \
+              FALSE "potato"      "~1GB RAM, 1-2 cores, HDD - bare minimum, no effects" \
+              FALSE "light"       "Low-spec but usable - dock on, no compositor/blur" \
+              FALSE "performance" "Capable hardware - full look, full-weight packs" \
+              FALSE "maxed"       "High-end hardware - everything enabled" \
+              --width=650 --height=350 2>/dev/null) || TIER=""
+
+          PACKS=$(zenity --list --title="Choose your use-case packs" \
+              --text="Pick one or more (change later with 'revilis pack install/remove <name>'):" \
+              --checklist \
+              --column="Pick" --column="Pack" --column="Description" \
+              FALSE "developer" "Code editors, git, language runtimes, containers" \
+              FALSE "gamer"     "Gaming platforms, emulation, perf tools" \
+              TRUE  "office"    "Documents, spreadsheets, presentations, PDFs" \
+              TRUE  "home"      "Everyday browsing, media, communication" \
+              --width=650 --height=350 --separator=" " 2>/dev/null) || PACKS=""
+
+          if [[ -n "$TIER" || -n "$PACKS" ]]; then
+              zenity --info --width=420 --title="Setting up Revilis" \
+                  --text="Applying your choices. This runs in a terminal so you can see progress." 2>/dev/null || true
+
+              CMD=""
+              if [[ -n "$TIER" ]]; then
+                  CMD+="sudo revilis tier apply $TIER; "
+              fi
+              for p in $PACKS; do
+                  CMD+="sudo revilis pack install $p; "
+              done
+              CMD+="echo; echo Press enter to close.; read"
+
+              xfce4-terminal --title="Revilis Setup" -e "bash -c '$CMD'" &
+          else
+              zenity --info --width=400 --title="No changes made" \
+                  --text="Keeping current settings. Run 'revilis' any time from the terminal or desktop shortcut to change tier or packs." 2>/dev/null || true
+          fi
+
+          touch "$MARKER"
+          rm -f "$AUTOSTART_FILE"
+          FIRSTBOOT_EOF
+          chmod +x build/bin/revilis-firstboot-gui
+
+      - name: Generate autostart entry, desktop shortcut, and sudoers rule
+        run: |
+          mkdir -p build/skel/.config/autostart
+          mkdir -p build/skel/Desktop
+          mkdir -p build/sudoers
+
+          cat > build/skel/.config/autostart/revilis-firstboot.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Revilis Welcome
+          Comment=First-run welcome and preset chooser for Revilis
+          Exec=/usr/local/bin/revilis-firstboot-gui
+          Icon=preferences-system
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > build/skel/Desktop/revilis-guide.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Revilis Guide & Settings
+          Comment=Learn about Revilis presets and change your system's performance profile
+          Exec=xfce4-terminal --title="Revilis" -e "bash -c 'revilis guide; echo; revilis'"
+          Icon=preferences-system
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          cat > build/sudoers/revilis <<'EOF'
+          # Allow members of the 'revilis' group to run the revilis CLI without a password.
+          %revilis ALL=(root) NOPASSWD: /usr/local/bin/revilis
+          EOF
+
+      - name: Generate Mac-inspired desktop defaults (panel, dock, window buttons)
+        run: |
+          mkdir -p build/skel/.config/xfce4/xfconf/xfce-perchannel-xml
+          mkdir -p build/skel/.config/plank/dock1
+          mkdir -p build/skel/.config/autostart
+
+          # --- Top panel: single Mac-style bar, no global menu, clock+status icons ---
+          cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfce4-panel" version="1.0">
+            <property name="panels" type="array">
+              <value type="int" value="1"/>
+              <property name="panel-1" type="empty">
+                <property name="position" type="string" value="p=6;x=0;y=0"/>
+                <property name="position-locked" type="bool" value="true"/>
+                <property name="length" type="uint" value="100"/>
+                <property name="size" type="uint" value="26"/>
+                <property name="mode" type="uint" value="0"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="1"/>
+                  <value type="int" value="2"/>
+                  <value type="int" value="3"/>
+                  <value type="int" value="4"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="applicationsmenu">
+                <property name="button-title" type="string" value="Revilis"/>
+                <property name="show-button-title" type="bool" value="true"/>
+              </property>
+              <property name="plugin-2" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-3" type="string" value="systray"/>
+              <property name="plugin-4" type="string" value="clock">
+                <property name="digital-format" type="string" value="%a %b %e  %I:%M %p"/>
+              </property>
+            </property>
+          </channel>
+          EOF
+
+          # --- XFWM: keep buttons top-right (not Mac-left), themed for hover-highlight only ---
+          # Note: XFWM doesn't support per-button hover color natively via xfconf alone;
+          # the hover-highlight look comes from the GTK/xfwm theme's button assets
+          # (installed via revilis-theme, see hook below), this just sets layout + theme name.
+          cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="theme" type="string" value="Arc-Dark"/>
+              <property name="title_font" type="string" value="Inter Medium 9"/>
+              <property name="button_layout" type="string" value="|H M C"/>
+              <property name="use_compositing" type="bool" value="true"/>
+              <property name="show_frame_shadow" type="bool" value="true"/>
+              <property name="show_popup_shadow" type="bool" value="true"/>
+              <property name="frame_border_top" type="uint" value="1"/>
+            </property>
+          </channel>
+          EOF
+
+          # --- GTK / icon theme selection ---
+          cat > "build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xsettings" version="1.0">
+            <property name="Net" type="empty">
+              <property name="ThemeName" type="string" value="Arc-Dark"/>
+              <property name="IconThemeName" type="string" value="Papirus-Dark"/>
+            </property>
+            <property name="Gtk" type="empty">
+              <property name="FontName" type="string" value="Inter 10"/>
+            </property>
+          </channel>
+          EOF
+
+          # --- Plank dock config: bottom, zoom-on-hover, translucent/blur-style theme ---
+          cat > "build/skel/.config/plank/dock1/settings" <<'EOF'
+          [PlankDockPreferences]
+          Position=bottom
+          Alignment=center
+          IconSize=48
+          ZoomEnabled=true
+          ZoomPercent=150
+          HideMode=intelligent
+          Theme=Translucent
+          PinnedOnly=false
+          EOF
+
+          # Autostart plank on login
+          cat > build/skel/.config/autostart/plank.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Plank Dock
+          Exec=plank
+          Icon=plank
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          # Autostart picom for blur/transparency behind the dock and windows
+          cat > build/skel/.config/autostart/picom.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Compositor
+          Exec=picom --config /etc/revilis/picom.conf
+          Icon=preferences-system
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          mkdir -p build/config/revilis
+          cat > build/config/revilis/picom.conf <<'EOF'
+          # Revilis compositor config: blur + rounded-corner feel for the dock/panel,
+          # kept light so it stays usable on the 'potato' preset if compositor is off anyway.
+          backend = "glx";
+          vsync = true;
+
+          blur-method = "dual_kawase";
+          blur-strength = 5;
+          blur-background = true;
+          blur-background-frame = true;
+          blur-background-fixed = true;
+
+          corner-radius = 10;
+          rounded-corners-exclude = [
+            "window_type = 'dock'",
+            "window_type = 'desktop'"
+          ];
+
+          shadow = true;
+          shadow-radius = 12;
+          shadow-opacity = 0.35;
+
+          fading = true;
+          fade-in-step = 0.03;
+          fade-out-step = 0.03;
+          EOF
+
+      - name: Set up live-build config tree
+        run: |
+          LB_DIR="$PWD/livebuild-config"
+          rm -rf "$LB_DIR"
+          mkdir -p "$LB_DIR"
+          cd "$LB_DIR"
+
+          lb config \
+              --ignore-system-defaults \
+              --mode debian \
+              --distribution bookworm \
+              --archive-areas "main contrib non-free non-free-firmware" \
+              --architecture amd64 \
+              --binary-images iso-hybrid \
+              --iso-application "Revilis Prototype" \
+              --iso-volume "REVILIS" \
+              --iso-preparer "Revilis Project" \
+              --iso-publisher "Revilis Project" \
+              --linux-flavours "amd64:amd64" \
+              --linux-packages "linux-image linux-headers" \
+              --memtest none \
+              --win32-loader false \
+              --debian-installer none \
+              --apt-recommends false \
+              --bootstrap-keyring "debian-archive-keyring" \
+              --mirror-bootstrap "http://deb.debian.org/debian" \
+              --mirror-chroot "http://deb.debian.org/debian" \
+              --mirror-chroot-security "http://security.debian.org/debian-security" \
+              --security false \
+              --mirror-binary "http://deb.debian.org/debian" \
+              --mirror-binary-security "http://security.debian.org/debian-security"
+
+          # live-build's own --security flag generates an outdated "DIST/updates"
+          # security suite path that doesn't exist since Debian bookworm (the
+          # correct suite is "bookworm-security"). We disabled it above and
+          # write the correct sources.list files ourselves instead.
+          mkdir -p config/archives
+          cat > config/archives/revilis-security.list.chroot <<'EOF'
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          EOF
+          cat > config/archives/revilis-security.list.binary <<'EOF'
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          EOF
+
+          mkdir -p config/package-lists
+          cat > config/package-lists/revilis-core.list.chroot <<'EOF'
+          xfce4-session
+          xfce4-panel
+          xfce4-settings
+          xfwm4
+          xfdesktop4
+          lightdm
+          lightdm-gtk-greeter
+          network-manager
+          network-manager-gnome
+          sudo
+          zram-tools
+          zenity
+          xfce4-terminal
+          thunar
+          plank
+          xfce4-appfinder
+          arc-theme
+          papirus-icon-theme
+          fonts-inter
+          fonts-noto-color-emoji
+          picom
+          xdotool
+          mlocate
+          EOF
+
+          mkdir -p config/includes.chroot/usr/local/bin
+          mkdir -p config/includes.chroot/etc/revilis
+          mkdir -p config/includes.chroot/etc/skel/.config/autostart
+          mkdir -p config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml
+          mkdir -p config/includes.chroot/etc/skel/.config/plank/dock1
+          mkdir -p config/includes.chroot/etc/skel/.config/gtk-3.0
+          mkdir -p config/includes.chroot/etc/skel/Desktop
+          mkdir -p config/includes.chroot/etc/sudoers.d
+
+          cp "$GITHUB_WORKSPACE/build/bin/revilis" config/includes.chroot/usr/local/bin/revilis
+          cp "$GITHUB_WORKSPACE/build/bin/revilis-firstboot-gui" config/includes.chroot/usr/local/bin/revilis-firstboot-gui
+          chmod +x config/includes.chroot/usr/local/bin/revilis
+          chmod +x config/includes.chroot/usr/local/bin/revilis-firstboot-gui
+
+          cp "$GITHUB_WORKSPACE/build/config/revilis/tiers.conf" config/includes.chroot/etc/revilis/tiers.conf
+          cp "$GITHUB_WORKSPACE/build/config/revilis/packs.conf" config/includes.chroot/etc/revilis/packs.conf
+          cp "$GITHUB_WORKSPACE/build/config/revilis/picom.conf" config/includes.chroot/etc/revilis/picom.conf
+          cp "$GITHUB_WORKSPACE/build/skel/.config/autostart/revilis-firstboot.desktop" config/includes.chroot/etc/skel/.config/autostart/revilis-firstboot.desktop
+          cp "$GITHUB_WORKSPACE/build/skel/.config/autostart/plank.desktop" config/includes.chroot/etc/skel/.config/autostart/plank.desktop
+          cp "$GITHUB_WORKSPACE/build/skel/.config/autostart/picom.desktop" config/includes.chroot/etc/skel/.config/autostart/picom.desktop
+          cp "$GITHUB_WORKSPACE/build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml
+          cp "$GITHUB_WORKSPACE/build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+          cp "$GITHUB_WORKSPACE/build/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+          cp "$GITHUB_WORKSPACE/build/skel/.config/plank/dock1/settings" config/includes.chroot/etc/skel/.config/plank/dock1/settings
+          cp "$GITHUB_WORKSPACE/build/skel/Desktop/revilis-guide.desktop" config/includes.chroot/etc/skel/Desktop/revilis-guide.desktop
+          cp "$GITHUB_WORKSPACE/build/sudoers/revilis" config/includes.chroot/etc/sudoers.d/revilis
+
+          mkdir -p config/hooks/live
+          cat > config/hooks/live/9010-revilis-setup.hook.chroot <<'EOF'
+          #!/bin/sh
+          set -e
+
+          groupadd -f revilis
+
+          if ! id liveuser >/dev/null 2>&1; then
+              useradd -m -s /bin/bash -G sudo,revilis,netdev,plugdev liveuser
+              echo "liveuser:live" | chpasswd
+          fi
+
+          mkdir -p /etc/lightdm/lightdm.conf.d
+          cat > /etc/lightdm/lightdm.conf.d/50-revilis-autologin.conf <<CONF
+          [Seat:*]
+          autologin-user=liveuser
+          autologin-user-timeout=0
+          CONF
+
+          mkdir -p /etc/systemd
+          cat > /etc/systemd/zram-generator.conf <<CONF
+          [zram0]
+          zram-size = ram * 30 / 100
+          compression-algorithm = zstd
+          CONF
+
+          systemctl enable NetworkManager || true
+          systemctl enable lightdm || true
+
+          echo "revilis setup hook complete"
+          EOF
+          chmod +x config/hooks/live/9010-revilis-setup.hook.chroot
+
+      - name: Validate tiers.conf and packs.conf
+        run: |
+          echo "Checking tiers.conf..."
+          for key in ZRAM_PERCENT ZRAM_ALGO TARGET_IDLE_MB SWAPPINESS COMPOSITOR BLUR ANIMATIONS DOCK THUMBNAILS INDEXING PACK_WEIGHT DESCRIPTION; do
+            count=$(grep -c "^${key}=" build/config/revilis/tiers.conf || true)
+            echo "  $key found $count times"
+            if [ "$count" -lt 5 ]; then
+              echo "::error::tiers.conf missing $key in one or more tiers (expected 5)"
+              exit 1
+            fi
+          done
+
+          echo "Checking packs.conf..."
+          for key in DESCRIPTION PACKAGES_MINIMAL PACKAGES_STANDARD PACKAGES_FULL; do
+            count=$(grep -c "^${key}=" build/config/revilis/packs.conf || true)
+            echo "  $key found $count times"
+            if [ "$count" -lt 4 ]; then
+              echo "::error::packs.conf missing $key in one or more packs (expected 4)"
+              exit 1
+            fi
+          done
+
+      - name: Build ISO
+        working-directory: livebuild-config
+        run: |
+          set -o pipefail
+          sudo lb build 2>&1 | tee build.log
+
+      - name: Rename ISO with version/date
+        working-directory: livebuild-config
+        run: |
+          ISO_FILE=$(find . -maxdepth 1 -name "*.iso" | head -n1)
+          if [ -z "$ISO_FILE" ]; then
+            echo "::error::No ISO produced. Last 100 lines of build.log:"
+            tail -n 100 build.log || echo "no build.log found"
+            exit 1
+          fi
+          DATE=$(date +%Y%m%d)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          NEW_NAME="revilis-prototype-${DATE}-${SHORT_SHA}.iso"
+          mv "$ISO_FILE" "$NEW_NAME"
+          echo "ISO_NAME=$NEW_NAME" >> "$GITHUB_ENV"
+
+      - name: Generate checksum
+        working-directory: livebuild-config
+        run: sha256sum "${{ env.ISO_NAME }}" > "${{ env.ISO_NAME }}.sha256"
+
+      - name: Upload ISO as artifact (only for release builds, to avoid burning artifact storage quota)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release == true)
+        uses: actions/upload-artifact@v4
+        with:
+          name: revilis-prototype-iso
+          path: |
+            livebuild-config/${{ env.ISO_NAME }}
+            livebuild-config/${{ env.ISO_NAME }}.sha256
+          retention-days: 3
+
+      - name: Upload build log (always, for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: livebuild-config/build.log
+          retention-days: 3
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            livebuild-config/${{ env.ISO_NAME }}
+            livebuild-config/${{ env.ISO_NAME }}.sha256
+          generate_release_notes: true
