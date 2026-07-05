@@ -944,6 +944,7 @@ jobs:
               --iso-preparer "Revilis Project" \
               --iso-publisher "Revilis Project" \
               --linux-flavours amd64 \
+              --firmware-chroot false \
               --memtest none \
               --win32-loader false \
               --debian-installer none \
