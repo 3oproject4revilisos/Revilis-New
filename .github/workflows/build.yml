@@ -947,7 +947,7 @@ jobs:
               --firmware-chroot false \
               --memtest none \
               --win32-loader false \
-              --debian-installer none \
+              --debian-installer false \
               --apt-recommends false \
               --bootstrap-keyring "debian-archive-keyring" \
               --mirror-bootstrap "http://deb.debian.org/debian" \
