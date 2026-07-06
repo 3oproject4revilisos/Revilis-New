@@ -18,7 +18,7 @@ concurrency:
 jobs:
   build-iso:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 90
     steps:
       - name: Free up disk space on runner
         run: |
@@ -1054,6 +1054,7 @@ jobs:
 
       - name: Build ISO
         working-directory: livebuild-config
+        timeout-minutes: 60
         run: |
           set -o pipefail
           {
