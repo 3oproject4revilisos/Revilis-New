@@ -1110,8 +1110,9 @@ jobs:
       - name: Automated boot test (QEMU, BIOS mode) - catches silent boot-menu failures
         if: steps.rename_iso.outcome == 'success'
         working-directory: livebuild-config
+        timeout-minutes: 5
         run: |
-          sudo apt-get install -y qemu-system-x86 qemu-utils imagemagick socat >/dev/null 2>&1
+          sudo apt-get install -y qemu-system-x86 qemu-utils imagemagick python3 >/dev/null 2>&1
 
           echo "Booting ISO headlessly in QEMU (legacy BIOS mode, matching VirtualBox's default)..."
           sudo qemu-system-x86_64 \
@@ -1120,22 +1121,47 @@ jobs:
             -boot d \
             -display none \
             -no-reboot \
-            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+            -qmp unix:/tmp/qemu-qmp.sock,server,nowait \
             &
           QEMU_PID=$!
+
+          echo "Waiting for QMP socket to become available..."
+          for i in $(seq 1 20); do
+            [ -S /tmp/qemu-qmp.sock ] && break
+            sleep 1
+          done
 
           echo "Waiting 70s for BIOS/bootloader/kernel to reach a boot menu or login screen..."
           sleep 70
 
-          echo "Requesting screenshot via QEMU monitor..."
-          echo "screendump /tmp/boot-screenshot.ppm" | sudo timeout 10 socat - unix-connect:/tmp/qemu-monitor.sock || echo "socat screendump command failed"
-          sleep 2
+          echo "Requesting screenshot via QMP (scripted protocol, not the human monitor)..."
+          python3 <<'PYEOF' || echo "QMP screenshot script failed, boot test will be marked inconclusive"
+          import socket, json, sys
 
+          sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          sock.settimeout(10)
+          try:
+              sock.connect("/tmp/qemu-qmp.sock")
+              # QMP handshake: server sends greeting, we must send qmp_capabilities
+              sock.recv(4096)
+              sock.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+              sock.recv(4096)
+              sock.sendall(json.dumps({
+                  "execute": "screendump",
+                  "arguments": {"filename": "/tmp/boot-screenshot.ppm"}
+              }).encode() + b"\n")
+              resp = sock.recv(4096)
+              print("QMP response:", resp.decode(errors="replace"))
+          finally:
+              sock.close()
+          PYEOF
+
+          sleep 2
           sudo pkill qemu-system-x86_64 2>/dev/null || true
           wait $QEMU_PID 2>/dev/null || true
 
           if [ ! -f /tmp/boot-screenshot.ppm ]; then
-            echo "::warning::Could not capture a boot screenshot (QEMU monitor issue) - boot test inconclusive, not blocking the build. See 'Inspect ISO boot structure' step for the direct isolinux.cfg/grub.cfg check instead."
+            echo "::warning::Could not capture a boot screenshot (QMP issue) - boot test inconclusive, not blocking the build. See 'Inspect ISO boot structure' step for the direct isolinux.cfg/grub.cfg check instead."
             exit 0
           fi
 
@@ -1146,9 +1172,6 @@ jobs:
           mkdir -p /tmp/boot-test-artifacts
           sudo cp /tmp/boot-screenshot.png /tmp/boot-test-artifacts/ 2>/dev/null || true
 
-          # A truly black/blank screen (bootloader never rendered a menu, kernel
-          # never reached a console/desktop) averages very close to 0. Anything
-          # with a boot menu, text console, or desktop will be well above this.
           BRIGHTNESS_INT=${BRIGHTNESS%.*}
           if [ "$BRIGHTNESS_INT" -lt 5 ]; then
             echo "::error::Boot screen is essentially pure black (brightness=$BRIGHTNESS) after 70s. This matches the isolinux/grub.cfg-missing failure mode. Failing the build so this doesn't ship silently."
