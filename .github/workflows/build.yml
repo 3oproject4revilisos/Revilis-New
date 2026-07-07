@@ -1116,7 +1116,7 @@ jobs:
           sudo apt-get install -y qemu-system-x86 qemu-utils imagemagick python3 >/dev/null 2>&1
 
           echo "Booting ISO headlessly in QEMU (legacy BIOS mode, matching VirtualBox's default)..."
-          sudo qemu-system-x86_64 \
+          sudo timeout --signal=KILL 100 qemu-system-x86_64 \
             -m 1024 \
             -cdrom "${{ env.ISO_NAME }}" \
             -boot d \
@@ -1158,8 +1158,9 @@ jobs:
           PYEOF
 
           sleep 2
-          sudo pkill qemu-system-x86_64 2>/dev/null || true
-          wait $QEMU_PID 2>/dev/null || true
+          echo "Force-killing QEMU (not relying on wait, which mistracks the PID under sudo backgrounding)..."
+          sudo pkill -9 -f qemu-system-x86_64 2>/dev/null || true
+          sleep 1
 
           if [ ! -f /tmp/boot-screenshot.ppm ]; then
             echo "::warning::Could not capture a boot screenshot (QMP issue) - boot test inconclusive, not blocking the build. See 'Inspect ISO boot structure' step for the direct isolinux.cfg/grub.cfg check instead."
