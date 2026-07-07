@@ -1136,7 +1136,7 @@ jobs:
           sleep 70
 
           echo "Requesting screenshot via QMP (scripted protocol, not the human monitor)..."
-          python3 <<'PYEOF' || echo "QMP screenshot script failed, boot test will be marked inconclusive"
+          sudo python3 <<'PYEOF' || echo "QMP screenshot script failed, boot test will be marked inconclusive"
           import socket, json, sys
 
           sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
